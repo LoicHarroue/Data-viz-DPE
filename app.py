@@ -1,26 +1,27 @@
 """
-Dashboard Dash - Parc tertiaire par classe DPE (données de TEST)
+Dashboard Dash - Parc tertiaire par classe DPE (données ADEME préparées)
 
 Navigation : France > régions > départements > communes
 KPI 1 : répartition du parc par classe énergie (A à G)
 KPI 2 : part de "passoires" (classes F + G)
 KPI 3 : surface à rénover (m² des bâtiments en classes E, F et G)
 
-Lancement :  python app.py   puis   http://127.0.0.1:8050
+Préparation des données (une fois) :  python prepare_data.py chemin/vers/dpe_tertiaire.csv
+Lancement :                           python app.py   puis   http://127.0.0.1:8050
 """
 import json
 import math
 import re
 import unicodedata
 import urllib.request
-import zlib
 from functools import lru_cache
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Dash, Input, Output, State, ctx, dcc, html, no_update
+
+from ref_geo import DEPT_TO_REGION, REGIONS_DEPTS
 
 # --------------------------------------------------------------------------
 # Constantes
@@ -50,31 +51,6 @@ TOP_N = 5                                        # nb de barres dans le graphiqu
 
 BASE_URL = "https://raw.githubusercontent.com/gregoiredavid/france-geojson/master/"
 GEO_DIR = Path(__file__).parent / "geojson"
-
-# Région (code INSEE) -> départements (France métropolitaine)
-REGIONS_DEPTS = {
-    "11": ["75", "77", "78", "91", "92", "93", "94", "95"],
-    "24": ["18", "28", "36", "37", "41", "45"],
-    "27": ["21", "25", "39", "58", "70", "71", "89", "90"],
-    "28": ["14", "27", "50", "61", "76"],
-    "32": ["02", "59", "60", "62", "80"],
-    "44": ["08", "10", "51", "52", "54", "55", "57", "67", "68", "88"],
-    "52": ["44", "49", "53", "72", "85"],
-    "53": ["22", "29", "35", "56"],
-    "75": ["16", "17", "19", "23", "24", "33", "40", "47", "64", "79", "86", "87"],
-    "76": ["09", "11", "12", "30", "31", "32", "34", "46", "48", "65", "66", "81", "82"],
-    "84": ["01", "03", "07", "15", "26", "38", "42", "43", "63", "69", "73", "74"],
-    "93": ["04", "05", "06", "13", "83", "84"],
-    "94": ["2A", "2B"],
-}
-DEPT_TO_REGION = {d: r for r, ds in REGIONS_DEPTS.items() for d in ds}
-
-# Part moyenne fictive de passoires (F+G) par région, pour avoir des écarts visibles
-BASE_PASSOIRES = {
-    "11": 0.14, "24": 0.22, "27": 0.25, "28": 0.21, "32": 0.27, "44": 0.26,
-    "52": 0.16, "53": 0.15, "75": 0.19, "76": 0.18, "84": 0.20, "93": 0.17,
-    "94": 0.28,
-}
 
 EMPTY_NAV = {"region": None, "dept": None, "communes": False, "commune": None}
 
@@ -154,71 +130,66 @@ def get_geo(level: str, region, dept):
 
 
 # --------------------------------------------------------------------------
-# Données de TEST (cohérentes entre niveaux : communes -> départements -> régions)
-#
-# Pour utiliser de vraies données : remplacer dept_data() et commune_data() par un
-# chargement des agrégats ADEME (mêmes colonnes : code, nom, A..G, S_A..S_G).
+# Données : tables DÉJÀ agrégées et calculées par prepare_data.py (aucun calcul ici)
 # --------------------------------------------------------------------------
-def add_kpis(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["total"] = df[CLASSES].sum(axis=1)
-    df["nb_passoires"] = df[["F", "G"]].sum(axis=1)
-    df["part_passoires"] = df["nb_passoires"] / df["total"].where(df["total"] > 0)
-    df["surface_totale"] = df[SURF_COLS].sum(axis=1)
-    df["surface_renover"] = df[[f"S_{c}" for c in RENOVER]].sum(axis=1)
-    return df
+DATA_DIR = Path(__file__).parent / "data"
+CHIFFRES = CLASSES + SURF_COLS + ["total", "nb_passoires", "surface_totale", "surface_renover"]
 
 
 @lru_cache(maxsize=8)
-def dept_data(seed: int) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    rows = []
-    for code_dept, code_region in DEPT_TO_REGION.items():
-        total = int(rng.lognormal(mean=10.0, sigma=0.6))
-        fg = float(np.clip(rng.normal(BASE_PASSOIRES[code_region], 0.035), 0.06, 0.45))
-        poids_ae = rng.dirichlet(np.array([0.04, 0.12, 0.28, 0.32, 0.24]) * 60)
-        probs = np.concatenate([poids_ae * (1 - fg), [fg * 0.6, fg * 0.4]])
-        counts = rng.multinomial(total, probs)
-        surf_moy = rng.lognormal(np.log(900), 0.2, size=7)   # m² moyen / bâtiment
-        rows.append({"code": code_dept, "code_region": code_region,
-                     **dict(zip(CLASSES, counts)),
-                     **dict(zip(SURF_COLS, counts * surf_moy))})
-    df = add_kpis(pd.DataFrame(rows))
-    df["nom"] = df["code"].map(NOM_DEPT)
+def load_table(name: str) -> pd.DataFrame:
+    path = DATA_DIR / name
+    if not path.exists():
+        raise FileNotFoundError(f"{path} introuvable : lancer d'abord "
+                                "python prepare_data.py <fichier DPE tertiaire.csv>")
+    return pd.read_csv(path, dtype={"code": str, "code_dept": str, "code_region": str})
+
+
+def complete(df: pd.DataFrame, codes: list, noms: dict) -> pd.DataFrame:
+    """Une ligne par zone du fond de carte ; une zone absente des données = 0 bâtiment."""
+    df = df.set_index("code").reindex(codes)
+    df.index.name = "code"
+    df[CHIFFRES] = df[CHIFFRES].fillna(0)
+    df = df.reset_index()
+    df["nom"] = df["code"].map(noms)
     return df
 
 
-@lru_cache(maxsize=8)
-def region_data(seed: int) -> pd.DataFrame:
-    df = dept_data(seed).groupby("code_region", as_index=False)[CLASSES + SURF_COLS].sum()
-    df = add_kpis(df)
-    df["code"] = df["code_region"]
-    df["nom"] = df["code"].map(NOM_REGION)
+@lru_cache(maxsize=1)
+def dept_data() -> pd.DataFrame:
+    df = complete(load_table("departements.csv"), list(DEPT_TO_REGION), NOM_DEPT)
+    df["code_region"] = df["code"].map(DEPT_TO_REGION)
     return df
 
 
-@lru_cache(maxsize=8)
-def france_data(seed: int) -> pd.Series:
-    return add_kpis(dept_data(seed)[CLASSES + SURF_COLS].sum().to_frame().T).iloc[0]
+@lru_cache(maxsize=1)
+def region_data() -> pd.DataFrame:
+    return complete(load_table("regions.csv"), list(NOM_REGION), NOM_REGION)
+
+
+@lru_cache(maxsize=1)
+def france_data() -> pd.Series:
+    return load_table("france.csv").iloc[0]
 
 
 @lru_cache(maxsize=32)
-def commune_data(seed: int, code_dept: str) -> pd.DataFrame:
-    """Répartit les totaux du département entre ses communes (somme exacte)."""
+def commune_data(code_dept: str) -> pd.DataFrame:
     feats = load_geojson(communes_path(code_dept))["features"]
-    n = len(feats)
-    parent = dept_data(seed).set_index("code").loc[code_dept]
-    rng = np.random.default_rng([seed, zlib.crc32(code_dept.encode())])
-    taille = rng.lognormal(0, 1.2, n)                        # communes très inégales
-    out = {"code": [f["properties"]["code"] for f in feats],
-           "nom": [f["properties"]["nom"] for f in feats]}
-    for c in CLASSES:
-        w = taille * rng.lognormal(0, 0.5, n)
-        counts = rng.multinomial(int(parent[c]), w / w.sum())
-        out[c] = counts
-        surf_moy = parent[f"S_{c}"] / parent[c] if parent[c] else 0.0
-        out[f"S_{c}"] = counts * surf_moy
-    return add_kpis(pd.DataFrame(out))
+    codes = [f["properties"]["code"] for f in feats]
+    noms = {f["properties"]["code"]: f["properties"]["nom"] for f in feats}
+    t = load_table("communes.csv")
+    t = t[t["code_dept"] == code_dept]
+    absentes = sorted(set(t["code"]) - set(codes))
+    if absentes:                       # ex. communes fusionnées depuis la date du fond de carte
+        print(f"[communes] {len(absentes)} commune(s) du DPE absente(s) du fond de carte "
+              f"({code_dept}) : {absentes[:5]}")
+    return complete(t, codes, noms)
+
+
+@lru_cache(maxsize=1)
+def load_meta() -> dict:
+    path = DATA_DIR / "meta.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
 # --------------------------------------------------------------------------
@@ -248,34 +219,34 @@ def apply_event(nav: dict, trigger: str, click) -> dict:
     return nav
 
 
-def build_view(nav: dict, seed: int) -> dict:
+def build_view(nav: dict) -> dict:
     """Détermine ce qui est affiché : niveau, tableau de données, sélection, panneau."""
     region, dept, communes, commune = (nav[k] for k in ("region", "dept", "communes", "commune"))
     level = "france" if region is None else ("dept" if communes else "region")
 
     if level == "france":
-        df, selected, unit = region_data(seed), None, "régions"
+        df, selected, unit = region_data(), None, "régions"
     elif level == "region":
-        d = dept_data(seed)
+        d = dept_data()
         df, selected, unit = d[d["code_region"] == region], dept, "départements"
     else:
-        df, selected, unit = commune_data(seed, dept), commune, "communes"
+        df, selected, unit = commune_data(dept), commune, "communes"
 
     # Entité décrite dans le panneau + référence de comparaison
     if commune:
-        row, ref = df[df["code"] == commune].iloc[0], dept_data(seed).set_index("code").loc[dept]
+        row, ref = df[df["code"] == commune].iloc[0], dept_data().set_index("code").loc[dept]
         titre, ref_label = f"{row['nom']} ({commune})", "vs département"
         niveau_txt = "Commune"
     elif dept:
-        row = dept_data(seed).set_index("code").loc[dept].copy()
+        row = dept_data().set_index("code").loc[dept].copy()
         row["code"] = dept
-        ref = region_data(seed).set_index("code").loc[DEPT_TO_REGION[dept]]
+        ref = region_data().set_index("code").loc[DEPT_TO_REGION[dept]]
         titre, ref_label, niveau_txt = f"{NOM_DEPT[dept]} ({dept})", "vs région", "Département"
     elif region:
-        row, ref = region_data(seed).set_index("code").loc[region], france_data(seed)
+        row, ref = region_data().set_index("code").loc[region], france_data()
         titre, ref_label, niveau_txt = NOM_REGION[region], "vs France", "Région"
     else:
-        row, ref, titre, ref_label, niveau_txt = france_data(seed), None, "France métropolitaine", "", "Pays"
+        row, ref, titre, ref_label, niveau_txt = france_data(), None, "France métropolitaine", "", "Pays"
 
     crumb = ["France"]
     if region:
@@ -419,6 +390,14 @@ def delta_span(part, ref_part, label, pal):
 # --------------------------------------------------------------------------
 # Application
 # --------------------------------------------------------------------------
+def subtitle() -> str:
+    m = load_meta()
+    if not m:
+        return "Données non préparées : lancer prepare_data.py"
+    return (f"Source : DPE tertiaire ADEME ({m['source']}) · {fr(m['nb_batiments'])} bâtiments "
+            f"· données préparées le {m['genere_le']}")
+
+
 app = Dash(__name__, title="Parc tertiaire - DPE")
 server = app.server
 
@@ -428,8 +407,8 @@ app.layout = html.Div(style={"fontFamily": "system-ui, sans-serif", "maxWidth": 
     dcc.Download(id="download"),
 
     html.Div(style={"marginBottom": "12px"}, children=[
-        html.H1("Comment se répartit le DPE du parc tertiaire ?", style={"margin": "0 0 4px"}),
-        html.Div("Répartition de la surface DPE selon les territoires.", style={"color": "#666"}),
+        html.H1("Parc tertiaire par classe DPE", style={"margin": "0 0 4px"}),
+        html.Div(subtitle(), style={"color": "#666"}),
     ]),
 
     html.Div(style={"display": "flex", "alignItems": "center", "marginBottom": "8px",
@@ -446,17 +425,14 @@ app.layout = html.Div(style={"fontFamily": "system-ui, sans-serif", "maxWidth": 
             dcc.Loading(dcc.Graph(id="map", config={"scrollZoom": True, "displaylogo": False})),
             html.Div(style={"display": "flex", "gap": "24px", "alignItems": "center",
                             "flexWrap": "wrap", "marginTop": "8px"}, children=[
-                html.Div([html.Label("Graine aléatoire "),
-                          dcc.Input(id="seed", type="number", value=42, min=0, step=1,
-                                    debounce=True, style={"width": "80px"})]),
                 html.Div(style={"width": "380px"}, children=[
                     html.Label("Seuil min. de bâtiments par commune (sous le seuil : gris)"),
                     dcc.Slider(id="seuil", min=0, max=100, step=5, value=20,
                                marks={0: "0", 20: "20", 50: "50", 100: "100"},
                                tooltip={"placement": "bottom"}),
                 ]),
-                html.Button("Télécharger les données (CSV)", id="btn-csv", style=BTN),
-                html.Button("Filtre Daltonie : désactivée", id="btn-palette", style=BTN),
+                html.Button("Télécharger les données (départements, CSV)", id="btn-csv", style=BTN),
+                html.Button("Palette Okabe-Ito : désactivée", id="btn-palette", style=BTN),
             ]),
         ]),
         html.Div([
@@ -493,14 +469,13 @@ def navigate(click, *_):
     Output("btn-france", "style"), Output("btn-region", "style"),
     Output("btn-communes", "style"), Output("btn-communes", "children"),
     Output("btn-clear", "style"), Output("btn-palette", "children"),
-    Input("nav", "data"), Input("seuil", "value"), Input("seed", "value"),
-    Input("btn-palette", "n_clicks"),
+    Input("nav", "data"), Input("seuil", "value"), Input("btn-palette", "n_clicks"),
 )
-def render(nav, seuil, seed, n_palette):
-    seed, seuil = int(seed or 0), int(seuil or 0)
+def render(nav, seuil, n_palette):
+    seuil = int(seuil or 0)
     okabe = (n_palette or 0) % 2 == 1                         # un clic sur deux
     pal = PALETTES["okabe" if okabe else "default"]
-    v = build_view(nav, seed)
+    v = build_view(nav)
     row, ref = v["row"], v["ref"]
 
     metrics = [
@@ -532,15 +507,12 @@ def render(nav, seuil, seed, n_palette):
             show(nav["region"] is not None), show(nav["communes"]),
             show(bool(nav["dept"]) and not nav["communes"]), btn_communes_label,
             show(clear_visible),
-            "Filtre Daltonie : activée" if okabe else "Filtre Daltonie : désactivée")
+            "Palette Okabe-Ito : activée" if okabe else "Palette Okabe-Ito : désactivée")
 
 
-@app.callback(Output("download", "data"), Input("btn-csv", "n_clicks"),
-              State("seed", "value"), prevent_initial_call=True)
-def download(_, seed):
-    cols = ["code", "nom", "code_region"] + CLASSES + SURF_COLS
-    return dcc.send_data_frame(dept_data(int(seed or 0))[cols].to_csv,
-                               "dpe_test_departements.csv", index=False)
+@app.callback(Output("download", "data"), Input("btn-csv", "n_clicks"), prevent_initial_call=True)
+def download(_):
+    return dcc.send_file(str(DATA_DIR / "departements.csv"))
 
 
 if __name__ == "__main__":

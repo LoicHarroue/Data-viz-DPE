@@ -1,0 +1,20 @@
+{
+  "source": "dpe01tertiaire.csv",
+  "genere_le": "2026-10-26 10:02",
+  "dpe_expires_exclus": true,
+  "surface": "surface_utile, sinon surface_shon ; 0 si absente ou > 1000000 m2 (le bâtiment reste compté)",
+  "surface_a_renover": "classes E, F, G",
+  "nb_batiments": 292719,
+  "nb_communes_avec_donnees": 14455,
+  "nettoyage": {
+    "lignes_lues": 577175,
+    "etiquette_invalide": 277926,
+    "remplaces_par_un_dpe_plus_recent": 5,
+    "expires": 0,
+    "doublons": 0,
+    "sans_commune": 6356,
+    "hors_metropole": 169,
+    "surface_invalide_ou_absente": 0,
+    "retenues": 292719
+  }
+}
