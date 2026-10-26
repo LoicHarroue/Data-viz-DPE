@@ -1,3 +1,7 @@
+choix de biblios : Dash, plotly, pandas, numpy
+données pour la carte d'un repos publique gihub de gregoiredavid/france-geojson
+
+
 Question métier :
 Où le besoin est-il à la fois fort en volume et en urgence ?	Surface à rénover × part de passoires
 
